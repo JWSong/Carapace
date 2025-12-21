@@ -1,5 +1,31 @@
 use std::net::SocketAddrV4;
 
+use thiserror::Error;
+
+/// STUN protocol errors
+///
+/// Using an enum instead of string errors provides:
+/// - Pattern matching for error handling
+/// - Type safety (compiler catches typos)
+/// - Self-documenting API (errors visible in signature)
+#[derive(Debug, Error)]
+pub enum StunError {
+    #[error("message too short: expected at least {expected} bytes, got {actual}")]
+    MessageTooShort { expected: usize, actual: usize },
+
+    #[error("invalid magic cookie: expected 0x{expected:08X}, got 0x{actual:08X}")]
+    InvalidMagicCookie { expected: u32, actual: u32 },
+
+    #[error("unknown message type: 0x{0:04X}")]
+    UnknownMessageType(u16),
+
+    #[error("unsupported message type: {0:?}")]
+    UnsupportedMessageType(MessageType),
+
+    #[error("IPv6 is not supported yet")]
+    Ipv6NotSupported,
+}
+
 /// STUN Magic Cookie (RFC 5389)
 pub const MAGIC_COOKIE: u32 = 0x2112A442;
 
@@ -17,23 +43,33 @@ pub struct StunRequest<'a> {
 }
 
 impl<'a> StunRequest<'a> {
+    /// Parse a STUN request from raw bytes
+    ///
+    /// # Errors
+    /// - `StunError::MessageTooShort` - if data is less than 20 bytes
+    /// - `StunError::InvalidMagicCookie` - if magic cookie doesn't match
+    /// - `StunError::UnknownMessageType` - if message type is not recognized
     #[inline]
-    pub fn parse(data: &'a [u8]) -> Result<Self, &'static str> {
+    pub fn parse(data: &'a [u8]) -> Result<Self, StunError> {
         if data.len() < HEADER_SIZE {
-            return Err("Message too short");
+            return Err(StunError::MessageTooShort {
+                expected: HEADER_SIZE,
+                actual: data.len(),
+            });
         }
 
-        // Message Type (bytes 0-1)
         let msg_type_raw = u16::from_be_bytes([data[0], data[1]]);
-        let msg_type = MessageType::from_u16(msg_type_raw).ok_or("Unknown message type")?;
+        let msg_type = MessageType::from_u16(msg_type_raw)
+            .ok_or(StunError::UnknownMessageType(msg_type_raw))?;
 
-        // validate magic cookie
         let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         if cookie != MAGIC_COOKIE {
-            return Err("Invalid magic cookie");
+            return Err(StunError::InvalidMagicCookie {
+                expected: MAGIC_COOKIE,
+                actual: cookie,
+            });
         }
 
-        // extract transaction id
         let transaction_id = &data[8..20];
 
         Ok(Self {
@@ -60,43 +96,23 @@ impl StunResponse {
     pub fn binding_response(transaction_id: &[u8], client_addr: SocketAddrV4) -> Self {
         let mut buffer = [0u8; BINDING_RESPONSE_SIZE];
 
-        // === Header (20 bytes) ===
-
-        // message type: Binding Response (0x0101)
         buffer[0] = 0x01;
         buffer[1] = 0x01;
-
-        // message length: 12 bytes (XOR-MAPPED-ADDRESS attribute)
         buffer[2] = 0x00;
         buffer[3] = 0x0C;
-
-        // copy magic cookie
         buffer[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-
-        // copy transaction id
         buffer[8..20].copy_from_slice(transaction_id);
 
-        // === XOR-MAPPED-ADDRESS Attribute (12 bytes) ===
-
-        // attribute type: 0x0020
         buffer[20] = 0x00;
         buffer[21] = 0x20;
-
-        // attribute length: 8 bytes
         buffer[22] = 0x00;
         buffer[23] = 0x08;
-
-        // reserved: 0x00
         buffer[24] = 0x00;
-
-        // family: IPv4 (0x01)
         buffer[25] = 0x01;
 
-        // XOR'd port
         let xor_port = client_addr.port() ^ ((MAGIC_COOKIE >> 16) as u16);
         buffer[26..28].copy_from_slice(&xor_port.to_be_bytes());
 
-        // XOR'd address
         let ip_bytes = client_addr.ip().octets();
         let magic_bytes = MAGIC_COOKIE.to_be_bytes();
         buffer[28] = ip_bytes[0] ^ magic_bytes[0];
